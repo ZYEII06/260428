@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <title>HandPose 互動藝術</title>
+
+  <!-- p5.js -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.0/p5.min.js"></script>
+
+  <!-- ML5.js 0.12.2（支援 HandPose，相容手機） -->
+  <script src="https://unpkg.com/ml5@0.12.2/dist/ml5.min.js"></script>
+
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+    html, body {
+      width: 100%; height: 100%;
+      overflow: hidden;
+      background: #e7c6ff;
+      font-family: 'Helvetica Neue', 'PingFang TC', 'Microsoft JhengHei', sans-serif;
+    }
+
+    /* 啟動畫面（WebGL + 鏡頭授權說明） */
+    #splash {
+      position: fixed;
+      inset: 0;
+      background: rgba(231, 198, 255, 0.97);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 16px;
+      z-index: 100;
+      padding: 2rem;
+      text-align: center;
+    }
+
+    #splash h2 {
+      font-size: 1.3rem;
+      color: #5a0a9e;
+      font-weight: 600;
+    }
+
+    #splash p {
+      font-size: 0.9rem;
+      color: #555;
+      max-width: 320px;
+      line-height: 1.6;
+    }
+
+    .check-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 0.9rem;
+      color: #333;
+      background: white;
+      border-radius: 10px;
+      padding: 10px 20px;
+      width: 100%;
+      max-width: 320px;
+    }
+
+    .check-row .icon {
+      font-size: 1.2rem;
+      min-width: 24px;
+      text-align: center;
+    }
+
+    .check-row.ok   { border-left: 4px solid #4caf50; }
+    .check-row.warn { border-left: 4px solid #ff9800; }
+    .check-row.err  { border-left: 4px solid #f44336; }
+
+    #startBtn {
+      margin-top: 8px;
+      padding: 12px 36px;
+      background: #7b2fff;
+      color: white;
+      border: none;
+      border-radius: 30px;
+      font-size: 1rem;
+      cursor: pointer;
+      letter-spacing: 0.05em;
+    }
+    #startBtn:hover { background: #5a1fd4; }
+    #startBtn:disabled { background: #bbb; cursor: not-allowed; }
+
+    /* p5 canvas 填滿 */
+    canvas {
+      display: block;
+      position: fixed;
+      top: 0; left: 0;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- 啟動 / 檢查畫面 -->
+  <div id="splash">
+    <h2>HandPose 互動藝術</h2>
+    <p>請允許鏡頭存取，程式才能偵測手部動作。</p>
+
+    <div class="check-row" id="row-webgl">
+      <span class="icon">⏳</span>
+      <span>WebGL 支援檢查中...</span>
+    </div>
+
+    <div class="check-row" id="row-camera">
+      <span class="icon">⏳</span>
+      <span>攝影機存取檢查中...</span>
+    </div>
+
+    <div class="check-row" id="row-model">
+      <span class="icon">⏳</span>
+      <span>ML5 模型尚未載入</span>
+    </div>
+
+    <button id="startBtn" disabled>請稍候...</button>
+  </div>
+
+  <!-- sketch.js -->
+  <script src="sketch.js"></script>
+
+  <script>
+    // ── 啟動畫面邏輯 ───────────────────────────────────────
+    function setRow(id, status, text) {
+      // status: 'ok' | 'warn' | 'err' | 'loading'
+      const row  = document.getElementById(id);
+      const icon = row.querySelector('.icon');
+      const span = row.querySelectorAll('span')[1];
+      row.className = 'check-row ' + (status === 'loading' ? '' : status);
+      icon.textContent = { ok:'✅', warn:'⚠️', err:'❌', loading:'⏳' }[status] || '⏳';
+      span.textContent = text;
+    }
+
+    // 1. WebGL 檢查
+    (function() {
+      try {
+        let c = document.createElement('canvas');
+        let gl = c.getContext('webgl') || c.getContext('experimental-webgl');
+        if (gl) {
+          setRow('row-webgl', 'ok', 'WebGL 支援正常');
+        } else {
+          setRow('row-webgl', 'warn', 'WebGL 不支援，模型效能可能較差');
+        }
+      } catch(e) {
+        setRow('row-webgl', 'err', 'WebGL 檢查失敗：' + e.message);
+      }
+    })();
+
+    // 2. 攝影機檢查
+    navigator.mediaDevices.getUserMedia({ video: true })
+      .then(stream => {
+        stream.getTracks().forEach(t => t.stop()); // 先釋放，p5 會再開
+        setRow('row-camera', 'ok', '攝影機存取正常');
+        tryEnableStart();
+      })
+      .catch(err => {
+        setRow('row-camera', 'err', '攝影機無法存取：' + err.message);
+        tryEnableStart();
+      });
+
+    // 3. 監聽 sketch.js 裡的模型狀態（透過 statusMsg 輪詢）
+    let modelCheckInterval = setInterval(() => {
+      if (typeof statusMsg !== 'undefined') {
+        if (statusMsg.includes('成功')) {
+          setRow('row-model', 'ok', 'ML5 HandPose 模型載入成功');
+          clearInterval(modelCheckInterval);
+          tryEnableStart();
+        } else if (statusMsg.includes('失敗')) {
+          setRow('row-model', 'err', 'ML5 模型載入失敗');
+          clearInterval(modelCheckInterval);
+          tryEnableStart();
+        } else if (statusMsg.includes('載入中')) {
+          setRow('row-model', 'loading', 'ML5 模型載入中（需要網路）...');
+        }
+      }
+    }, 800);
+
+    function tryEnableStart() {
+      let webglRow  = document.getElementById('row-webgl').className;
+      let cameraRow = document.getElementById('row-camera').className;
+      // 只要 WebGL & 攝影機 ok 就允許開始（模型可能還在載）
+      if (!webglRow.includes('loading') && !cameraRow.includes('loading')) {
+        let btn = document.getElementById('startBtn');
+        btn.disabled = false;
+        btn.textContent = '開始體驗 →';
+      }
+    }
+
+    document.getElementById('startBtn').addEventListener('click', () => {
+      document.getElementById('splash').style.display = 'none';
+    });
+  </script>
+</body>
+</html>
